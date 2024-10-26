@@ -5,101 +5,74 @@ import { scrapeAmazonProduct } from "@/lib/scraper";
 import { getAveragePrice, getEmailNotifType, getHighestPrice, getLowestPrice } from "@/lib/utils";
 import { NextResponse } from "next/server";
 
-// Set to 50 seconds to give some buffer before Vercel's 60-second limit
-export const maxDuration = 50;
+export const maxDuration = 300;
+
 export const dynamic = 'force-dynamic';
+
 export const revalidate = 0;
 
 export const GET = async () => {
   try {
-    await connectToDB();
+    connectToDB();
 
-    // Get only products that haven't been updated in the last 24 hours
-    const currentTime = new Date();
-    const products = await Product.find({
-      lastChecked: { 
-        $lt: new Date(currentTime.getTime() - 24 * 60 * 60 * 1000) 
-      }
-    }).limit(5); // Process 5 products at a time
+    const products = await Product.find({});
 
-    if (!products || products.length === 0) {
-      return NextResponse.json({
-        message: 'No products need updating',
-        data: []
-      });
-    }
+    if (!products) throw new Error("No products found");
 
+    //1 scrape latest product details and update db
     const updatedProducts = await Promise.all(
       products.map(async (current) => {
-        try {
-          const scrapedProduct = await scrapeAmazonProduct(current.url);
+        const scrapedProduct = await scrapeAmazonProduct(current.url);
 
-          if (!scrapedProduct) {
-            console.log(`Skipping product ${current.url} - no data found`);
-            return current;
-          }
+        if (!scrapedProduct) throw new Error("No product found");
 
-          const updatedPriceHistory = [
-            ...current.priceHistory,
-            { price: scrapedProduct.currentPrice, date: new Date() }
+          const updatedPriceHistory: any = [
+            ...scrapedProduct.priceHistory,
+            { price: scrapedProduct.currentPrice },
           ];
-
-          // Keep only last 30 days of price history
-          const thirtyDaysAgo = new Date(currentTime.getTime() - 30 * 24 * 60 * 60 * 1000);
-          const trimmedPriceHistory = updatedPriceHistory.filter(
-            (record: any) => new Date(record.date) >= thirtyDaysAgo
-          );
 
           const product = {
             ...scrapedProduct,
-            priceHistory: trimmedPriceHistory,
-            lowestPrice: getLowestPrice(trimmedPriceHistory),
-            highestPrice: getHighestPrice(trimmedPriceHistory),
-            averagePrice: getAveragePrice(trimmedPriceHistory),
-            lastChecked: new Date(),
+            priceHistory: updatedPriceHistory,
+            lowestPrice: getLowestPrice(updatedPriceHistory),
+            highestPrice: getHighestPrice(updatedPriceHistory),
+            averagePrice: getAveragePrice(updatedPriceHistory),
           };
+        
 
-          const updatedProduct = await Product.findOneAndUpdate(
-            { url: scrapedProduct.url },
-            product,
-            { new: true }
-          );
+        const updatedProduct = await Product.findOneAndUpdate(
+            {url:scrapedProduct.url},
+            product
+        )
 
-          // Handle email notifications
-          if (updatedProduct && updatedProduct.users.length > 0) {
-            const emailNotifType = getEmailNotifType(scrapedProduct, current);
-            
-            if (emailNotifType) {
-              const productInfo = {
-                title: updatedProduct.title,
-                url: updatedProduct.url
-              };
+        //2 Check each product's status and send email accordingly
+        const emailNotifType = getEmailNotifType(scrapedProduct, current);
 
-              const emailContent = generateEmailBody(productInfo, emailNotifType);
-              const userEmails = updatedProduct.users.map((user: any) => user.email);
-              
-              // Send emails asynchronously without waiting
-              sendEmail(emailContent, userEmails).catch(console.error);
+        if(emailNotifType && updatedProduct.users.length > 0){
+            const productInfo = {
+                title:updatedProduct.title,
+                url:updatedProduct.url
             }
-          }
 
-          return updatedProduct;
-        } catch (error) {
-          console.error(`Error processing product ${current.url}:`, error);
-          return current;
+            const emailContent =  generateEmailBody(productInfo, emailNotifType);
+
+            const userEmails = updatedProduct.users.map((user:any) => user.email)
+
+            sendEmail(emailContent, userEmails);
+
+
         }
+
+        return updatedProduct;
+
       })
     );
 
     return NextResponse.json({
-      message: 'Ok',
-      data: updatedProducts
-    });
+        message:'Ok', data:updatedProducts
+    }
+    )
   } catch (error) {
-    console.error('Cron error:', error);
-    return NextResponse.json({
-      message: 'Error',
-      error: (error as Error).message
-    }, { status: 500 });
+    throw new Error(`Error in GET:${error}`);
   }
 };
