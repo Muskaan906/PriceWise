@@ -5,74 +5,103 @@ import { scrapeAmazonProduct } from "@/lib/scraper";
 import { getAveragePrice, getEmailNotifType, getHighestPrice, getLowestPrice } from "@/lib/utils";
 import { NextResponse } from "next/server";
 
-export const maxDuration = 300;
-
+// Set maximum duration to 60 seconds (hobby plan limit)
+export const maxDuration = 60;
 export const dynamic = 'force-dynamic';
-
 export const revalidate = 0;
+
+// Process products in smaller batches
+const BATCH_SIZE = 5;
 
 export const GET = async () => {
   try {
-    connectToDB();
+    await connectToDB();
 
+    // Get all products
     const products = await Product.find({});
+    if (!products?.length) {
+      return NextResponse.json({ message: 'No products found', data: [] });
+    }
 
-    if (!products) throw new Error("No products found");
-
-    //1 scrape latest product details and update db
-    const updatedProducts = await Promise.all(
-      products.map(async (current) => {
-        const scrapedProduct = await scrapeAmazonProduct(current.url);
-
-        if (!scrapedProduct) throw new Error("No product found");
-
-          const updatedPriceHistory: any = [
-            ...scrapedProduct.priceHistory,
-            { price: scrapedProduct.currentPrice },
-          ];
-
-          const product = {
-            ...scrapedProduct,
-            priceHistory: updatedPriceHistory,
-            lowestPrice: getLowestPrice(updatedPriceHistory),
-            highestPrice: getHighestPrice(updatedPriceHistory),
-            averagePrice: getAveragePrice(updatedPriceHistory),
-          };
-        
-
-        const updatedProduct = await Product.findOneAndUpdate(
-            {url:scrapedProduct.url},
-            product
-        )
-
-        //2 Check each product's status and send email accordingly
-        const emailNotifType = getEmailNotifType(scrapedProduct, current);
-
-        if(emailNotifType && updatedProduct.users.length > 0){
-            const productInfo = {
-                title:updatedProduct.title,
-                url:updatedProduct.url
+    const results = [];
+    
+    // Process products in batches
+    for (let i = 0; i < products.length; i += BATCH_SIZE) {
+      const batch = products.slice(i, i + BATCH_SIZE);
+      
+      const batchResults = await Promise.all(
+        batch.map(async (current) => {
+          try {
+            const scrapedProduct = await scrapeAmazonProduct(current.url);
+            
+            if (!scrapedProduct) {
+              console.warn(`No data found for product: ${current.url}`);
+              return null;
             }
 
-            const emailContent =  generateEmailBody(productInfo, emailNotifType);
+            // Update price history
+            const updatedPriceHistory = [
+              ...current.priceHistory,
+              { price: scrapedProduct.currentPrice, date: new Date() }
+            ];
 
-            const userEmails = updatedProduct.users.map((user:any) => user.email)
+            // Calculate new metrics
+            const product = {
+              ...scrapedProduct,
+              priceHistory: updatedPriceHistory,
+              lowestPrice: getLowestPrice(updatedPriceHistory),
+              highestPrice: getHighestPrice(updatedPriceHistory),
+              averagePrice: getAveragePrice(updatedPriceHistory),
+            };
 
-            sendEmail(emailContent, userEmails);
+            // Update product in database
+            const updatedProduct = await Product.findOneAndUpdate(
+              { url: scrapedProduct.url },
+              product,
+              { new: true }
+            );
 
+            // Check if email notification is needed
+            const emailNotifType = getEmailNotifType(scrapedProduct, current);
+            
+            if (emailNotifType && updatedProduct.users?.length > 0) {
+              const productInfo = {
+                title: updatedProduct.title,
+                url: updatedProduct.url
+              };
 
-        }
+              const emailContent = generateEmailBody(productInfo, emailNotifType);
+              const userEmails = updatedProduct.users.map((user: any) => user.email);
+              
+              // Send emails asynchronously without waiting
+              sendEmail(emailContent, userEmails).catch(error => 
+                console.error(`Failed to send email for ${updatedProduct.url}:`, error)
+              );
+            }
 
-        return updatedProduct;
+            return updatedProduct;
+          } catch (error) {
+            console.error(`Error processing product ${current.url}:`, error);
+            return null;
+          }
+        })
+      );
 
-      })
-    );
+      results.push(...batchResults.filter(Boolean));
+    }
 
     return NextResponse.json({
-        message:'Ok', data:updatedProducts
-    }
-    )
+      message: 'Products updated successfully',
+      data: results,
+      processed: results.length,
+      total: products.length
+    });
+
   } catch (error) {
-    throw new Error(`Error in GET:${error}`);
+    console.error('Cron job error:', error);
+    return NextResponse.json(
+      { message: `Error in cron job: ${error}`, error: true },
+      { status: 500 }
+    );
   }
 };
